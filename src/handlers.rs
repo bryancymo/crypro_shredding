@@ -1,20 +1,24 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::{Result, EncryptedCustomer, DecryptedCustomer, NewCustomer, EncryptedCustomerData};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use rdkafka::ClientConfig;
-use rdkafka::producer::{BaseProducer, BaseRecord};
+use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+use tracing::info;
 use warp::{http::StatusCode, reply, Reply};
 use rand::{distributions::Alphanumeric, Rng};
 
 
-pub async fn get_decrypted_customer(id: String, datastore: &HashMap<Vec<u8>, EncryptedCustomer>, keystore: &HashMap<Vec<u8>, Vec<u8>>, master_key: &Vec<u8>) -> Result<impl Reply> {
+pub async fn get_decrypted_customer(id: String, datastore: & Mutex<HashMap<Vec<u8>, EncryptedCustomer>>, keystore: & Mutex<HashMap<Vec<u8>, Vec<u8>>>, master_key: &[u8]) -> Result<impl Reply> {
 
-    match keystore.get(id.as_bytes()){
+    match keystore.lock().unwrap().get(id.as_bytes()){
         Some(nonce) => {
-            let mut cipher = ChaCha20::new(master_key.as_slice().into(), nonce.as_slice().into());
-            match datastore.get(id.as_bytes()){
+            info!("Found key");
+            let mut cipher = ChaCha20::new(master_key.into(), nonce.as_slice().into());
+            match datastore.lock().unwrap().get(id.as_bytes()){
                 Some(enc_customer) => {
                     let mut first_name_buffer = enc_customer.personal_data.first_name.clone();
                     cipher.apply_keystream(&mut first_name_buffer);
@@ -39,8 +43,8 @@ pub async fn get_decrypted_customer(id: String, datastore: &HashMap<Vec<u8>, Enc
     }
 }
 
-pub async fn get_encrypted_customer(id: String, datastore: &HashMap<Vec<u8>, EncryptedCustomer>) -> Result<impl Reply> {
-    match datastore.get(id.as_bytes()){
+pub async fn get_encrypted_customer(id: String, datastore: &Mutex<HashMap<Vec<u8>, EncryptedCustomer>>) -> Result<impl Reply> {
+    match datastore.lock().unwrap().get(id.as_bytes()){
         Some(customer) => {
             return Ok(reply::with_status(reply::json(customer), StatusCode::OK))
         },
@@ -48,7 +52,7 @@ pub async fn get_encrypted_customer(id: String, datastore: &HashMap<Vec<u8>, Enc
     }
 }
 
-pub async fn create_customer(customer: NewCustomer, master_key: &Vec<u8>) -> Result<impl Reply> {
+pub async fn create_customer(customer: NewCustomer, master_key: &[u8]) -> Result<impl Reply> {
     let customer_key: String = rand::thread_rng()
     .sample_iter(&Alphanumeric)
     .take(12)
@@ -63,7 +67,7 @@ pub async fn create_customer(customer: NewCustomer, master_key: &Vec<u8>) -> Res
     .collect();
     let nonce_copy = nonce.to_owned();
 
-    let mut cipher = ChaCha20::new(master_key.as_slice().into(), nonce.as_bytes().into());
+    let mut cipher = ChaCha20::new(master_key.into(), nonce.as_bytes().into());
     let producer: BaseProducer = ClientConfig::new()
     .set("bootstrap.servers", "localhost:9092")
     .create()
@@ -94,7 +98,9 @@ pub async fn create_customer(customer: NewCustomer, master_key: &Vec<u8>) -> Res
             .key(customer_key_copy.as_str()),
     ).expect("Failed to enqueue");
 
-    Ok(reply::with_status(reply::reply(), StatusCode::CREATED))
+    producer.flush(Duration::from_secs(1));
+
+    Ok(reply::with_status(reply::json(&customer_key_copy), StatusCode::CREATED))
 }
 
 pub async fn delete_customer(id: String) -> Result<impl Reply> {
@@ -103,12 +109,13 @@ pub async fn delete_customer(id: String) -> Result<impl Reply> {
     .create()
     .expect("Unable to create producer");
 
-    producer.send(
-        BaseRecord::to("customer_data_keys")
-            .payload(b"")
-            .key(id.as_str()),
-    ).expect("Failed to enqueue");
 
+
+    producer.send(BaseRecord::to("customer_data_keys")
+                        .payload(&[])
+                        .key(id.as_str())).expect("Failed to enqueue");
+    
+    producer.flush(Duration::from_secs(1));
     
     Ok(reply::with_status(reply::reply(), StatusCode::ACCEPTED))
 }

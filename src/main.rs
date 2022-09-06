@@ -1,18 +1,33 @@
+#[macro_use]
+extern crate lazy_static;
 
-use std::{collections::HashMap, time::Duration, os::unix::prelude::OsStrExt};
+use std::{collections::HashMap, time::Duration};
 
-use rand::{distributions::Alphanumeric, Rng};
+
 use rdkafka::{ClientConfig, consumer::{Consumer, BaseConsumer}, Message};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
 use uuid::Uuid;
+use std::sync::Mutex;
 
 use warp::{self, Filter, Rejection};
 type Result<T> = std::result::Result<T, Rejection>;
 
 mod handlers;
 
+
+lazy_static! {
+    static ref KEYSTORE: Mutex<HashMap<Vec<u8>,Vec<u8>>> = {
+        Mutex::new(HashMap::new())
+    };
+    static ref DATASTORE: Mutex<HashMap<Vec<u8>,EncryptedCustomer>> = {
+        Mutex::new(HashMap::new())
+    };
+    static ref MASTER_KEY: [u8; 32] = {
+        [0x42; 32]
+    };
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() {
@@ -27,27 +42,20 @@ async fn main() {
     )
     .init();
 
- 
-    let master_key: [u8; 32] =   [0x42; 32];
-
-    info!("Initialize Keystore");
-    let mut keystore: HashMap<Vec<u8>,Vec<u8>> = HashMap::new();
-
-    info!("Initialize Datastore");
-    let mut datastore: HashMap<Vec<u8>,EncryptedCustomer> = HashMap::new();
-
-    info!("Starting streams");
     let mut tasks = vec![];
-    tasks.push(tokio::spawn(async move { fill_keystore(&mut keystore).await }));
-    tasks.push(tokio::spawn(async move { fill_datastore(&mut datastore).await }));
-    tasks.push(tokio::spawn(async move { webserver(&mut datastore, &mut keystore, master_key).await }));
+    tasks.push(tokio::spawn(async move { fill_keystore(&KEYSTORE).await }));
+    tasks.push(tokio::spawn(async move { fill_datastore(&DATASTORE).await }));
+    tasks.push(tokio::spawn(async { webserver(&DATASTORE, &KEYSTORE, MASTER_KEY.as_ref()).await }));
+
 
     futures::future::join_all(tasks).await;
     info!("all tasks completed");
 
+
 }
 
-pub async fn fill_keystore(keystore: &mut HashMap<Vec<u8>, Vec<u8>>) {
+pub async fn fill_keystore(keystore: &Mutex<HashMap<Vec<u8>, Vec<u8>>>) {
+    info!("Initialize Keystore stream");
 
     let consumer: BaseConsumer = local_kafka_client_config()
         .set("group.id", format!{"keystore_cg_{}", Uuid::new_v4()})
@@ -66,8 +74,20 @@ pub async fn fill_keystore(keystore: &mut HashMap<Vec<u8>, Vec<u8>>) {
                     Ok(m) => {
                         let key = m.key().expect("Key is mandatory").to_owned();
                         match m.payload() {
-                            Some(value) => keystore.insert(key, value.to_owned()),
-                            None => keystore.remove(&key),
+                            Some(value) => {
+                                if value.len() > 0 {
+                                    info!("Added key");
+                                    keystore.lock().unwrap().insert(key, value.to_owned())
+                                } else {
+                                    info!("Removed key");
+                                    keystore.lock().unwrap().remove(&key)
+                                }
+                               
+                            },
+                            None => {
+                                info!("Removed key");
+                                keystore.lock().unwrap().remove(&key)
+                            },
                         };
                     }
                 }
@@ -76,8 +96,8 @@ pub async fn fill_keystore(keystore: &mut HashMap<Vec<u8>, Vec<u8>>) {
     };
 }
 
-pub async fn fill_datastore(datastore: &mut HashMap<Vec<u8>, EncryptedCustomer>) {
-
+pub async fn fill_datastore(datastore: &Mutex<HashMap<Vec<u8>, EncryptedCustomer>>) {
+    info!("Initialize Datastore stream");
     let consumer: BaseConsumer = local_kafka_client_config()
         .set("group.id", format!{"customer_cg_{}", Uuid::new_v4()})
         .set("auto.offset.reset", "earliest")
@@ -96,7 +116,7 @@ pub async fn fill_datastore(datastore: &mut HashMap<Vec<u8>, EncryptedCustomer>)
                         let key = m.key().expect("Key is mandatory").to_owned();
                         match m.payload() {
                             Some(value) => {
-                                datastore.insert(key, serde_json::from_slice(value).expect("Invalid payload json format"));
+                                datastore.lock().unwrap().insert(key, serde_json::from_slice(value).expect("Invalid payload json format"));
                                 info!("InsertedCustomer");
                             },
                             None => warn!("Tombstoning data not allowed"),
@@ -108,8 +128,8 @@ pub async fn fill_datastore(datastore: &mut HashMap<Vec<u8>, EncryptedCustomer>)
     };
 }
 
-// &'static Vec<u8>
-pub async fn webserver(datastore: &'static HashMap<Vec<u8>, EncryptedCustomer>, keystore:  &'static HashMap<Vec<u8>, Vec<u8>>, master_key: &'static Vec<u8> ){
+pub async fn webserver(datastore: &'static  Mutex<HashMap<Vec<u8>, EncryptedCustomer>>, keystore:  &'static  Mutex<HashMap<Vec<u8>, Vec<u8>>>, master_key: &'static [u8]){
+    info!("Initialize Webserver");
     let root = warp::path::end().map(|| "Lets Scram!");
 
     let get_customer = warp::path!("customer" / String / "decrypted")
@@ -134,11 +154,10 @@ pub async fn webserver(datastore: &'static HashMap<Vec<u8>, EncryptedCustomer>, 
     .or(get_raw_customer)
     .or(post_customer)
     .or(delete_customer)
-    .with(warp::cors().allow_any_origin())
-    .with(warp::log("support::api"));
+    .with(warp::cors().allow_any_origin());
+    // .with(warp::log("support::api"));
 
     warp::serve(routes).run(([127, 0, 0, 1], 5000)).await;
-    ()
 }
 
 pub fn local_kafka_client_config() -> ClientConfig {
